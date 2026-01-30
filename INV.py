@@ -140,13 +140,34 @@ def sb_select_contagens() -> pd.DataFrame:
     cols = [c for c in cols_pref if c in df.columns] + [c for c in df.columns if c not in cols_pref]
     return df[cols]
 
-# ✅ ALTERAÇÃO PEDIDA: puxar produtos do Supabase e usar a descrição automaticamente
+# ✅ PRODUTOS SEM LIMITE (paginação - Supabase/PostgREST)
 @st.cache_data(ttl=120)
 def sb_select_produtos() -> pd.DataFrame:
-    # Tabela: public.Produtos | Colunas: Codigo, Descricao
-    resp = sb.table("Produtos").select("Codigo,Descricao").order("Codigo").execute()
-    data = resp.data or []
-    df = pd.DataFrame(data)
+    all_rows = []
+    start = 0
+    batch = 1000  # pode deixar 1000 (seguro). Se quiser, tente 2000.
+
+    while True:
+        resp = (
+            sb.table("Produtos")
+              .select("Codigo,Descricao")
+              .order("Codigo")
+              .range(start, start + batch - 1)
+              .execute()
+        )
+
+        data = resp.data or []
+        if not data:
+            break
+
+        all_rows.extend(data)
+
+        if len(data) < batch:
+            break
+
+        start += batch
+
+    df = pd.DataFrame(all_rows)
     if df.empty:
         return pd.DataFrame(columns=["Codigo", "Descricao"])
 

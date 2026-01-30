@@ -2,6 +2,9 @@ import streamlit as st
 import pandas as pd
 from pathlib import Path
 from datetime import datetime
+import os
+
+from supabase import create_client, Client
 
 # ==================================================
 # CONFIG
@@ -20,7 +23,6 @@ textarea,
     font-size: 16px !important;
     min-height: 48px !important;
 }
-
 /* Centralizar texto dentro dos SELECTBOX (Local e Código) */
 div[data-baseweb="select"] > div { text-align: center !important; }
 div[data-baseweb="select"] span {
@@ -34,38 +36,116 @@ div[data-baseweb="select"] span {
 st.title("📦 Inventário Supermercado")
 
 # ==================================================
-# CAMINHOS
-# ==================================================
-BASE_DIR = Path(__file__).parent
-DB_DIR = BASE_DIR / "db"
-DB_DIR.mkdir(exist_ok=True)
-
-ARQ_CONTAGENS = DB_DIR / "contagens.csv"
-ARQ_USUARIOS = DB_DIR / "usuarios.csv"
-CAMINHO_PRODUTOS = Path(r"C:\Users\aline.lima\Desktop\INVENTARIO\Produtos.xlsx")
-
-# ==================================================
-# FUNÇÕES
+# FUNÇÕES GERAIS
 # ==================================================
 def agora():
     return datetime.now().strftime("%d/%m/%Y %H:%M")
 
-def salvar_append(path: Path, linha: dict):
-    if path.exists():
-        df = pd.read_csv(path, dtype=str).fillna("")
-    else:
-        df = pd.DataFrame()
-    df = pd.concat([df, pd.DataFrame([linha])], ignore_index=True)
-    df.to_csv(path, index=False, encoding="utf-8-sig")
+# ==================================================
+# SUPABASE (SECRETS / supa.env / ENV)
+# ==================================================
+BASE_DIR = Path(__file__).parent
+SUPA_ENV_PATH = BASE_DIR / "supa.env"
 
-def salvar_csv(path: Path, df: pd.DataFrame):
-    df.to_csv(path, index=False, encoding="utf-8-sig")
+def carregar_supa_env(path: Path) -> dict:
+    cfg = {}
+    if not path.exists():
+        return cfg
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        k = k.strip()
+        v = v.strip().strip('"').strip("'")
+        cfg[k] = v
+    return cfg
+
+SUPA_FILE = carregar_supa_env(SUPA_ENV_PATH)
+
+def get_secret_safe(name: str):
+    try:
+        return st.secrets.get(name, None)
+    except Exception:
+        return None
+
+def get_env(name: str, default: str = "") -> str:
+    # 1) Streamlit Cloud Secrets
+    sec = get_secret_safe(name)
+    if sec is not None and str(sec).strip():
+        return str(sec).strip()
+
+    # 2) supa.env (mesma pasta do script)
+    if name in SUPA_FILE and str(SUPA_FILE[name]).strip():
+        return str(SUPA_FILE[name]).strip()
+
+    # 3) Variável de ambiente do SO
+    return str(os.getenv(name, default)).strip()
+
+SUPABASE_URL = get_env("SUPABASE_URL")
+SUPABASE_SERVICE_ROLE_KEY = get_env("SUPABASE_SERVICE_ROLE_KEY")
+
+if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
+    st.error(
+        "Faltam SUPABASE_URL e/ou SUPABASE_SERVICE_ROLE_KEY.\n\n"
+        "✅ Streamlit Cloud: Settings → Secrets\n"
+        "✅ Local: crie 'supa.env' na mesma pasta do app"
+    )
+    st.stop()
+
+sb: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
 
 # ==================================================
-# USUÁRIOS PADRÃO (CRIA AUTOMATICAMENTE)
+# SUPABASE - QUERIES
+# ==================================================
+def sb_select_usuarios() -> pd.DataFrame:
+    resp = sb.table("usuarios").select("usuario,senha,perfil").execute()
+    data = resp.data or []
+    df = pd.DataFrame(data)
+    if df.empty:
+        return pd.DataFrame(columns=["usuario", "senha", "perfil"])
+    df["usuario"] = df["usuario"].astype(str).str.strip().str.lower()
+    df["senha"] = df["senha"].astype(str).str.strip()
+    df["perfil"] = df["perfil"].astype(str).str.strip().str.lower()
+    return df[["usuario", "senha", "perfil"]]
+
+def sb_upsert_usuario(usuario: str, senha: str, perfil: str):
+    sb.table("usuarios").upsert(
+        {"usuario": usuario.strip().lower(), "senha": senha.strip(), "perfil": perfil.strip().lower()},
+        on_conflict="usuario"
+    ).execute()
+
+def sb_update_senha(usuario_alvo: str, nova_senha: str):
+    sb.table("usuarios").update(
+        {"senha": str(nova_senha).strip()}
+    ).eq("usuario", str(usuario_alvo).strip().lower()).execute()
+
+def sb_usuario_existe(usuario: str) -> bool:
+    u = str(usuario).strip().lower()
+    resp = sb.table("usuarios").select("usuario").eq("usuario", u).limit(1).execute()
+    return bool(resp.data)
+
+def sb_insert_contagem(linha: dict):
+    sb.table("contagens").insert(linha).execute()
+
+def sb_select_contagens() -> pd.DataFrame:
+    resp = sb.table("contagens").select("*").order("id", desc=True).execute()
+    data = resp.data or []
+    df = pd.DataFrame(data)
+    if df.empty:
+        return pd.DataFrame()
+    cols_pref = ["datahora","usuario","tipocontagem","local","etiqueta","codigo","descricao","qtdfisica"]
+    cols = [c for c in cols_pref if c in df.columns] + [c for c in df.columns if c not in cols_pref]
+    return df[cols]
+
+# ==================================================
+# SEED DE USUÁRIOS (SÓ SE TABELA VAZIA)
 # ==================================================
 def init_users():
-    if ARQ_USUARIOS.exists():
+    dfu = sb_select_usuarios()
+    if not dfu.empty:
         return
 
     users = [
@@ -87,19 +167,12 @@ def init_users():
         {"usuario":"vitor","senha":"123","perfil":"padrao"},
         {"usuario":"cibele","senha":"123","perfil":"padrao"},
     ]
-    salvar_csv(ARQ_USUARIOS, pd.DataFrame(users))
+    for u in users:
+        sb_upsert_usuario(u["usuario"], u["senha"], u["perfil"])
 
-def carregar_usuarios() -> pd.DataFrame:
-    init_users()
-    dfu = pd.read_csv(ARQ_USUARIOS, dtype=str).fillna("")
-    for c in ["usuario", "senha", "perfil"]:
-        if c not in dfu.columns:
-            dfu[c] = ""
-    dfu["usuario"] = dfu["usuario"].astype(str).str.strip().str.lower()
-    dfu["senha"] = dfu["senha"].astype(str).str.strip()
-    dfu["perfil"] = dfu["perfil"].astype(str).str.strip().str.lower()
-    return dfu[["usuario", "senha", "perfil"]]
-
+# ==================================================
+# LOGIN
+# ==================================================
 def autenticar(dfu: pd.DataFrame, usuario: str, senha: str):
     u = str(usuario).strip().lower()
     s = str(senha).strip()
@@ -110,27 +183,6 @@ def autenticar(dfu: pd.DataFrame, usuario: str, senha: str):
         return False, None
     return True, hit.iloc[0]["perfil"]
 
-def usuario_existe(dfu: pd.DataFrame, usuario: str) -> bool:
-    u = str(usuario).strip().lower()
-    return not dfu[dfu["usuario"] == u].empty
-
-def atualizar_senha(dfu: pd.DataFrame, usuario_alvo: str, nova_senha: str) -> pd.DataFrame:
-    u = str(usuario_alvo).strip().lower()
-    dfu.loc[dfu["usuario"] == u, "senha"] = str(nova_senha).strip()
-    salvar_csv(ARQ_USUARIOS, dfu)
-    return dfu
-
-def criar_usuario(dfu: pd.DataFrame, usuario_novo: str, senha_nova: str, perfil: str) -> pd.DataFrame:
-    u = str(usuario_novo).strip().lower()
-    s = str(senha_nova).strip()
-    p = str(perfil).strip().lower()
-    dfu = pd.concat([dfu, pd.DataFrame([{"usuario": u, "senha": s, "perfil": p}])], ignore_index=True)
-    salvar_csv(ARQ_USUARIOS, dfu)
-    return dfu
-
-# ==================================================
-# LOGIN
-# ==================================================
 if "logado" not in st.session_state:
     st.session_state.logado = False
 if "user" not in st.session_state:
@@ -138,7 +190,9 @@ if "user" not in st.session_state:
 if "perfil" not in st.session_state:
     st.session_state.perfil = ""
 
-dfu = carregar_usuarios()
+# garante seed antes de buscar
+init_users()
+dfu = sb_select_usuarios()
 
 if not st.session_state.logado:
     st.subheader("🔐 Login")
@@ -167,13 +221,14 @@ with top2:
         st.rerun()
 
 # ==================================================
-# PRODUTOS
+# PRODUTOS (Nuvem: upload / Local: tenta arquivo, mas não salva nada local)
 # ==================================================
-def carregar_produtos():
-    if not CAMINHO_PRODUTOS.exists():
+CAMINHO_PRODUTOS = Path(r"C:\Users\aline.lima\Desktop\INVENTARIO\Produtos.xlsx")
+
+def carregar_produtos_df(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
         return pd.DataFrame(columns=["Codigo", "Descricao"])
 
-    df = pd.read_excel(CAMINHO_PRODUTOS, dtype=str).fillna("")
     ren = {}
     for c in df.columns:
         cl = str(c).strip().lower()
@@ -192,6 +247,27 @@ def carregar_produtos():
     df["Descricao"] = df["Descricao"].astype(str).str.strip()
     df = df[df["Codigo"] != ""].drop_duplicates(subset=["Codigo"])
     return df[["Codigo", "Descricao"]]
+
+def carregar_produtos():
+    # Se rodar local e existir, lê apenas (não grava nada)
+    if CAMINHO_PRODUTOS.exists():
+        try:
+            df = pd.read_excel(CAMINHO_PRODUTOS, dtype=str).fillna("")
+            return carregar_produtos_df(df)
+        except Exception:
+            pass
+
+    # Cloud: upload
+    st.markdown("### 📦 Catálogo de produtos")
+    up = st.file_uploader("Envie o Produtos.xlsx (para habilitar a lista de códigos)", type=["xlsx"])
+    if up is None:
+        st.info("Sem Produtos.xlsx: use 'Digitar manualmente' para código e descrição.")
+        return pd.DataFrame(columns=["Codigo", "Descricao"])
+
+    df = pd.read_excel(up, dtype=str).fillna("")
+    dfp = carregar_produtos_df(df)
+    st.success(f"Catálogo carregado ✅ Itens: {len(dfp)}")
+    return dfp
 
 df_prod = carregar_produtos()
 
@@ -214,11 +290,6 @@ tab_admin = tabs_objs[2] if st.session_state.perfil == "admin" else None
 with tab_contagem:
     SELECIONE = "(SELECIONE)"
 
-    # ==================================================
-    # AJUSTE PEDIDO (SEM MEXER NO RESTO):
-    # vitor, junior e lucas -> local somente "Linha"
-    # demais -> opções normais
-    # ==================================================
     user_atual = st.session_state.user.strip().lower()
     somente_linha = user_atual in ["vitor", "junior", "lucas"]
 
@@ -229,9 +300,6 @@ with tab_contagem:
 
     st.subheader("🧾 Lançar contagem")
 
-    # ---------------------------
-    # LIMPAR CAMPOS APÓS SALVAR
-    # ---------------------------
     if "limpar_campos" not in st.session_state:
         st.session_state["limpar_campos"] = False
 
@@ -266,17 +334,21 @@ with tab_contagem:
     descricao = ""
 
     if modo == "Selecionar da lista":
-        opcoes_cod = [SELECIONE] + df_prod["Codigo"].tolist()
-        codigo_sel = st.selectbox("Código", opcoes_cod, key="codigo_sel")
+        if df_prod.empty:
+            st.warning("Catálogo vazio. Use 'Digitar manualmente' ou envie o Produtos.xlsx.")
+            codigo = st.text_input("Código (manual)", key="codigo_manual").strip()
+            descricao = st.text_input("Descrição (manual)", key="descricao_manual").strip()
+        else:
+            opcoes_cod = [SELECIONE] + df_prod["Codigo"].tolist()
+            codigo_sel = st.selectbox("Código", opcoes_cod, key="codigo_sel")
 
-        if codigo_sel != SELECIONE and not df_prod.empty:
-            hit = df_prod[df_prod["Codigo"] == codigo_sel]
-            if not hit.empty:
-                codigo = codigo_sel
-                descricao = hit["Descricao"].iloc[0]
+            if codigo_sel != SELECIONE:
+                hit = df_prod[df_prod["Codigo"] == codigo_sel]
+                if not hit.empty:
+                    codigo = codigo_sel
+                    descricao = hit["Descricao"].iloc[0]
 
-        st.text_input("Descrição", value=descricao, disabled=True)
-
+            st.text_input("Descrição", value=descricao, disabled=True)
     else:
         codigo = st.text_input("Código (manual)", key="codigo_manual").strip()
         descricao = st.text_input("Descrição (manual)", key="descricao_manual").strip()
@@ -295,18 +367,17 @@ with tab_contagem:
         elif not descricao:
             st.warning("Informe a DESCRIÇÃO.")
         else:
-            salvar_append(
-                ARQ_CONTAGENS,
+            sb_insert_contagem(
                 {
-                    "DataHora": agora(),
-                    "Usuario": st.session_state.user,
-                    "TipoContagem": tipo_contagem,
-                    "Local": local,
-                    "Etiqueta": etiqueta,
-                    "Codigo": codigo,
-                    "Descricao": descricao,
-                    "QtdFisica": str(int(qtd)),
-                },
+                    "datahora": agora(),
+                    "usuario": st.session_state.user,
+                    "tipocontagem": tipo_contagem,
+                    "local": local,
+                    "etiqueta": etiqueta,
+                    "codigo": codigo,
+                    "descricao": descricao,
+                    "qtdfisica": int(qtd),
+                }
             )
             st.session_state["limpar_campos"] = True
             st.success("Contagem salva ✅")
@@ -319,8 +390,10 @@ if st.session_state.perfil == "admin":
     with tab_contagens:
         st.subheader("📊 Contagens (somente admin)")
 
-        if ARQ_CONTAGENS.exists():
-            df_c = pd.read_csv(ARQ_CONTAGENS, dtype=str).fillna("")
+        df_c = sb_select_contagens()
+        if df_c.empty:
+            st.info("Nenhuma contagem registrada ainda.")
+        else:
             st.dataframe(df_c, use_container_width=True, height=520)
 
             st.download_button(
@@ -330,8 +403,6 @@ if st.session_state.perfil == "admin":
                 "text/csv",
                 use_container_width=True
             )
-        else:
-            st.info("Nenhuma contagem registrada ainda.")
 
 # ==================================================
 # TAB - ADMIN (SÓ ADMIN)
@@ -340,10 +411,10 @@ if st.session_state.perfil == "admin":
     with tab_admin:
         st.subheader("👤 Administração de usuários")
 
-        dfu = carregar_usuarios()
+        dfu = sb_select_usuarios()
 
         st.markdown("### 🔑 Trocar senha de usuário")
-        usuarios_lista = sorted(dfu["usuario"].tolist())
+        usuarios_lista = sorted(dfu["usuario"].tolist()) if not dfu.empty else []
         alvo = st.selectbox("Usuário", usuarios_lista, key="alvo_senha")
         nova = st.text_input("Nova senha", type="password", key="nova_senha")
 
@@ -351,7 +422,7 @@ if st.session_state.perfil == "admin":
             if not nova.strip():
                 st.warning("Informe a nova senha.")
             else:
-                dfu = atualizar_senha(dfu, alvo, nova)
+                sb_update_senha(alvo, nova)
                 st.success(f"Senha atualizada para: {alvo}")
 
         st.markdown("---")
@@ -363,12 +434,10 @@ if st.session_state.perfil == "admin":
         if st.button("Criar usuário", use_container_width=True, key="btn_cria"):
             if not novo_user or " " in novo_user:
                 st.warning("Informe um usuário válido (sem espaços).")
-            elif usuario_existe(dfu, novo_user):
+            elif sb_usuario_existe(novo_user):
                 st.warning("Esse usuário já existe.")
             elif not nova_senha2.strip():
                 st.warning("Informe a senha inicial.")
             else:
-                dfu = criar_usuario(dfu, novo_user, nova_senha2, perfil_novo)
+                sb_upsert_usuario(novo_user, nova_senha2, perfil_novo)
                 st.success("Usuário criado ✅")
-
-

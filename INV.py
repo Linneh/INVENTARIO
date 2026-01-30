@@ -140,6 +140,21 @@ def sb_select_contagens() -> pd.DataFrame:
     cols = [c for c in cols_pref if c in df.columns] + [c for c in df.columns if c not in cols_pref]
     return df[cols]
 
+# ✅ ALTERAÇÃO PEDIDA: puxar produtos do Supabase e usar a descrição automaticamente
+@st.cache_data(ttl=120)
+def sb_select_produtos() -> pd.DataFrame:
+    # Tabela: public.Produtos | Colunas: Codigo, Descricao
+    resp = sb.table("Produtos").select("Codigo,Descricao").order("Codigo").execute()
+    data = resp.data or []
+    df = pd.DataFrame(data)
+    if df.empty:
+        return pd.DataFrame(columns=["Codigo", "Descricao"])
+
+    df["Codigo"] = df["Codigo"].astype(str).str.strip()
+    df["Descricao"] = df["Descricao"].astype(str).str.strip()
+    df = df[df["Codigo"] != ""].drop_duplicates(subset=["Codigo"])
+    return df[["Codigo", "Descricao"]]
+
 # ==================================================
 # SEED DE USUÁRIOS (SÓ SE TABELA VAZIA)
 # ==================================================
@@ -221,55 +236,9 @@ with top2:
         st.rerun()
 
 # ==================================================
-# PRODUTOS (Nuvem: upload / Local: tenta arquivo, mas não salva nada local)
+# PRODUTOS (AGORA VEM DO SUPABASE)
 # ==================================================
-CAMINHO_PRODUTOS = Path(r"C:\Users\aline.lima\Desktop\INVENTARIO\Produtos.xlsx")
-
-def carregar_produtos_df(df: pd.DataFrame) -> pd.DataFrame:
-    if df is None or df.empty:
-        return pd.DataFrame(columns=["Codigo", "Descricao"])
-
-    ren = {}
-    for c in df.columns:
-        cl = str(c).strip().lower()
-        if cl in ["codigo", "código"]:
-            ren[c] = "Codigo"
-        elif cl in ["descricao", "descrição"]:
-            ren[c] = "Descricao"
-    df = df.rename(columns=ren)
-
-    if "Codigo" not in df.columns and len(df.columns) >= 1:
-        df = df.rename(columns={df.columns[0]: "Codigo"})
-    if "Descricao" not in df.columns and len(df.columns) >= 2:
-        df = df.rename(columns={df.columns[1]: "Descricao"})
-
-    df["Codigo"] = df["Codigo"].astype(str).str.strip()
-    df["Descricao"] = df["Descricao"].astype(str).str.strip()
-    df = df[df["Codigo"] != ""].drop_duplicates(subset=["Codigo"])
-    return df[["Codigo", "Descricao"]]
-
-def carregar_produtos():
-    # Se rodar local e existir, lê apenas (não grava nada)
-    if CAMINHO_PRODUTOS.exists():
-        try:
-            df = pd.read_excel(CAMINHO_PRODUTOS, dtype=str).fillna("")
-            return carregar_produtos_df(df)
-        except Exception:
-            pass
-
-    # Cloud: upload
-    st.markdown("### 📦 Catálogo de produtos")
-    up = st.file_uploader("Envie o Produtos.xlsx (para habilitar a lista de códigos)", type=["xlsx"])
-    if up is None:
-        st.info("Sem Produtos.xlsx: use 'Digitar manualmente' para código e descrição.")
-        return pd.DataFrame(columns=["Codigo", "Descricao"])
-
-    df = pd.read_excel(up, dtype=str).fillna("")
-    dfp = carregar_produtos_df(df)
-    st.success(f"Catálogo carregado ✅ Itens: {len(dfp)}")
-    return dfp
-
-df_prod = carregar_produtos()
+df_prod = sb_select_produtos()
 
 # ==================================================
 # TABS
@@ -335,7 +304,7 @@ with tab_contagem:
 
     if modo == "Selecionar da lista":
         if df_prod.empty:
-            st.warning("Catálogo vazio. Use 'Digitar manualmente' ou envie o Produtos.xlsx.")
+            st.warning("Catálogo (Supabase) vazio. Use 'Digitar manualmente' para código e descrição.")
             codigo = st.text_input("Código (manual)", key="codigo_manual").strip()
             descricao = st.text_input("Descrição (manual)", key="descricao_manual").strip()
         else:
@@ -349,9 +318,21 @@ with tab_contagem:
                     descricao = hit["Descricao"].iloc[0]
 
             st.text_input("Descrição", value=descricao, disabled=True)
+
     else:
+        # ✅ ALTERAÇÃO PEDIDA: digitou o código, busca a descrição no Supabase automaticamente
         codigo = st.text_input("Código (manual)", key="codigo_manual").strip()
-        descricao = st.text_input("Descrição (manual)", key="descricao_manual").strip()
+
+        desc_auto = ""
+        if codigo and not df_prod.empty:
+            hit = df_prod[df_prod["Codigo"] == codigo]
+            if not hit.empty:
+                desc_auto = hit["Descricao"].iloc[0]
+
+        if desc_auto:
+            descricao = st.text_input("Descrição", value=desc_auto, disabled=True, key="descricao_auto_manual")
+        else:
+            descricao = st.text_input("Descrição (manual)", key="descricao_manual").strip()
 
     qtd = st.number_input("Quantidade física", min_value=1, step=1, key="qtd")
 
@@ -441,3 +422,4 @@ if st.session_state.perfil == "admin":
             else:
                 sb_upsert_usuario(novo_user, nova_senha2, perfil_novo)
                 st.success("Usuário criado ✅")
+
